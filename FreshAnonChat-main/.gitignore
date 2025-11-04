@@ -23,6 +23,3 @@ __pycache__/
 # Файлы системы
 .DS_Store
 Thumbs.db
-
-.env
-.env.*

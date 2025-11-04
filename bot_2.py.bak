@@ -1,0 +1,620 @@
+from aiogram import F
+from aiogram import types
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).with_name(".env"))
+# bot_2.py
+import asyncio
+import logging
+import os
+import importlib
+import time
+from pathlib import Path
+from typing import Dict
+
+import aiogram
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, ContentType
+
+# -------------------------------
+# ЛОГИ + проверка версии aiogram
+# -------------------------------
+logging.basicConfig(level=logging.INFO)
+if int(aiogram.__version__.split(".")[0]) < 3:
+    raise RuntimeError(f"aiogram {aiogram.__version__} detected — require v3.x")
+
+# -------------------------------
+# TOKEN: env -> .env -> config.py -> fallback (вшит твой токен)
+# -------------------------------
+_ENV_KEYS = ("TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN")
+_FALLBACK_TOKEN = "6420964030:AAHmu7z5y9mf0byOHyDFwLisuvW6qnEpjfY"  # твой токен как фолбэк
+
+def _load_from_env():
+    for k in _ENV_KEYS:
+        v = os.getenv(k)
+        if v and v.strip():
+            return v.strip(), f"env:{k}"
+    return None, ""
+
+def _load_from_dotenv():
+    def try_env_file(p: Path):
+        if not p.exists():
+            return None
+        for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, val = line.split("=", 1)
+            k = k.strip().lstrip("\ufeff")
+            val = val.strip().strip('"').strip("'")
+            if k in _ENV_KEYS and val:
+                os.environ.setdefault("TOKEN", val)
+                return val, f".env:{k}@{p}"
+        return None
+
+    here = Path(__file__).resolve().parent
+    for base in (Path.cwd(), here, here.parent, here.parent.parent):
+        got = try_env_file(base / ".env")
+        if got:
+            return got
+    return None, ""
+
+def _load_from_config():
+    try:
+        mod = importlib.import_module("config")
+    except Exception:
+        return None, ""
+    for k in _ENV_KEYS:
+        if hasattr(mod, k):
+            val = str(getattr(mod, k) or "").strip()
+            if val:
+                os.environ.setdefault("TOKEN", val)
+                return val, f"config:{k}"
+    return None, ""
+
+def _resolve_token():
+    tok, src = _load_from_env()
+    if not tok:
+        tok, src = _load_from_dotenv()
+    if not tok:
+        tok, src = _load_from_config()
+    if not tok:
+        tok, src = _FALLBACK_TOKEN, "fallback:embedded"
+        os.environ.setdefault("TOKEN", tok)
+    masked = (tok.split(":", 1)[0] + ":***") if ":" in tok else "****"
+    logging.info("FreshAnonChat: TOKEN source = %s, value(masked) = %s", src or "unknown", masked)
+    return tok
+
+TOKEN = _resolve_token()
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru").lower()
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN", "")
+
+# -------------------------------
+# UI и клавиатуры
+# (ДОЛЖНЫ соответствовать твоим файлам texts_ui.py / keyboards.py)
+# -------------------------------
+from texts_ui import UIru, UIen
+from keyboards import main_menu_ru, main_menu_en, dialog_menu_ru, dialog_menu_en
+
+# Опциональные safe_edit_* (не критично, если модуля нет)
+try:
+    from utils_safe_edit import safe_edit_text, safe_edit_kb
+except Exception:
+    async def safe_edit_text(*a, **k): pass
+    async def safe_edit_kb(*a, **k): pass
+
+# -------------------------------
+# БД/матчинг + TTL-хранилище
+# -------------------------------
+from match_sqlite import (
+    add_to_queue, try_match, remove_from_queue,
+    get_partner_id, end_chat, init_db, in_queue
+)
+# purge_user может отсутствовать — делаем fallback
+try:
+    from match_sqlite import purge_user as db_purge_user
+except Exception:
+    async def db_purge_user(user_id: int):
+        # Мягкая очистка: завершить диалог + убрать из очереди
+        try:
+            await end_chat(user_id)
+        except Exception:
+            pass
+        try:
+            await remove_from_queue(user_id)
+        except Exception:
+            pass
+
+from media_store import ensure_user_dir, index_media, run_cleanup_loop, forget_user
+
+# -------------------------------
+# Бот/диспетчер
+# -------------------------------
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML), default=DefaultBotProperties(parse_mode=ParseMode.HTML), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+from media_store import setup_cleanup
+setup_cleanup(dp, interval_sec=60)
+
+
+# -------------------------------
+# Простая in-memory «анкета» пользователя
+# -------------------------------
+USERS: Dict[int, dict] = {}
+
+def ui_cls(user_id: int):
+    return UIru if USERS.get(user_id, {}).get("lang", DEFAULT_LANG) == "ru" else UIen
+
+def main_menu(user_id: int):
+    return main_menu_ru() if ui_cls(user_id) is UIru else main_menu_en()
+
+def dialog_menu(user_id: int):
+    return dialog_menu_ru() if ui_cls(user_id) is UIru else dialog_menu_en()
+
+async def profile_cb(user_id: int) -> dict:
+    d = USERS.get(user_id, {}) or {}
+    age = d.get("age", 22)
+    return {
+        "user_id": user_id,
+        "lang": d.get("lang", DEFAULT_LANG),
+        "age": age,
+        "gender": d.get("gender"),
+        "wants_gender": d.get("wants_gender", "any"),
+        "age_min": d.get("age_min", max(0, age - 2)),
+        "age_max": d.get("age_max", min(100, age + 2)),
+        "vibe": d.get("vibe"),
+        "interests": d.get("interests", []),
+    }
+
+# -------------------------------
+# /start
+# -------------------------------
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    uid = message.from_user.id
+    if uid not in USERS:
+        USERS[uid] = {
+            "lang": DEFAULT_LANG,
+            "age": 22,
+            "gender": None,
+            "wants_gender": "any",
+            "age_min": 20,
+            "age_max": 24,
+            "vibe": None,
+            "interests": [],
+        }
+    U = ui_cls(uid)
+    # Если в твоём texts_ui нет WELCOME — подстрахуемся дефолтом
+    welcome = getattr(U, "WELCOME", "Привет! Это Neverland Anonymous Chat. Выберите действие в меню.")
+    await message.answer(welcome, reply_markup=main_menu(uid))
+
+# -------------------------------
+# Главные кнопки поиска (без «нажмите ещё раз, чтобы остановить»)
+# -------------------------------
+@dp.message(F.text.in_({UIru.RANDOM, UIen.RANDOM}))
+async def on_random(message: Message):
+    uid = message.from_user.id
+    USERS.setdefault(uid, {})["wants_gender"] = "any"
+    await do_search_start(message, uid)
+
+@dp.message(F.text.in_({UIru.FIND_GIRL, UIen.FIND_GIRL}))
+async def on_find_girl(message: Message):
+    uid = message.from_user.id
+    USERS.setdefault(uid, {})["wants_gender"] = "f"
+    await do_search_start(message, uid)
+
+@dp.message(F.text.in_({UIru.FIND_BOY, UIen.FIND_BOY}))
+async def on_find_boy(message: Message):
+    uid = message.from_user.id
+    USERS.setdefault(uid, {})["wants_gender"] = "m"
+    await do_search_start(message, uid)
+
+# -------------------------------
+# Настройки / Профиль / О проекте / Премиум
+# -------------------------------
+@dp.message(F.text.in_({UIru.SETTINGS, UIen.SETTINGS}))
+async def on_settings(message: Message):
+    uid = message.from_user.id
+    d = USERS.get(uid, {}) or {}
+    lang_code = (d.get("lang") or DEFAULT_LANG).lower()
+    lang_human = "Русский" if lang_code == "ru" else "English"
+
+    gender_map_ru = {"m": "м", "f": "ж"}
+    gender_map_en = {"m": "m", "f": "f"}
+    gender = d.get("gender")
+    gender_human = (gender_map_ru if lang_code == "ru" else gender_map_en).get(gender, "—")
+
+    wants = (d.get("wants_gender") or "any").lower()
+    wants_human = (
+        {"any": "любой", "m": "парня", "f": "девушку"} if lang_code == "ru"
+        else {"any": "any", "m": "boy", "f": "girl"}
+    ).get(wants, "любой" if lang_code == "ru" else "any")
+
+    age = d.get("age", 22)
+    a1 = d.get("age_min", max(0, age - 2))
+    a2 = d.get("age_max", min(100, age + 2))
+    vibe = d.get("vibe") or "—"
+    interests = ", ".join(d.get("interests", [])) if d.get("interests") else "—"
+
+    title = "⚙ Настройки" if lang_code == "ru" else "⚙ Settings"
+    commands_caption = "Команды:" if lang_code == "ru" else "Commands:"
+
+    text = (
+        f"<b>{title}</b>\n"
+        f"Язык: {lang_human}\n"
+        f"Пол: {gender_human}\n"
+        f"Кого ищем: {wants_human}\n"
+        f"Возраст: {age}\n"
+        f"Окно возраста: {a1}–{a2}\n"
+        f"Вайб: {vibe}\n"
+        f"Интересы: {interests}\n\n"
+        f"{commands_caption}\n"
+        f"/age 25\n"
+        f"/gender m|f\n"
+        f"/wants any|m|f\n"
+        f"/window 18 22\n"
+        f"/vibe chill\n"
+        f"/interests rock, games\n"
+        f"/lang ru|en"
+    )
+    await message.answer(text, reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_({UIru.PROFILE, UIen.PROFILE}))
+async def on_profile(message: Message):
+    uid = message.from_user.id
+    d = USERS.get(uid, {}) or {}
+    text = (
+        f"<b>Профиль</b>\n"
+        f"Возраст: {d.get('age',22)}\n"
+        f"Пол: {d.get('gender') or '—'}\n"
+        f"Вайб: {d.get('vibe') or '—'}\n"
+        f"Интересы: {', '.join(d.get('interests', [])) or '—'}"
+    )
+    await message.answer(text, reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_({UIru.ABOUT, UIen.ABOUT}))
+async def on_about(message: Message):
+    uid = message.from_user.id
+    U = ui_cls(uid)
+    about = getattr(U, "ABOUT_TEXT",
+                    "🌌 <b>Neverland Anonymous Chat</b>\nАнонимный поиск собеседника. Будьте вежливы.")
+    await message.answer(about, reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_({UIru.PREMIUM, UIen.PREMIUM}))
+async def on_premium(message: Message):
+    uid = message.from_user.id
+    U = ui_cls(uid)
+    txt = (
+        f"<b>{U.PREMIUM_TITLE}</b>\n"
+        f"{U.PREMIUM_PACKS}\n"
+        f"• {U.PREMIUM_WEEK}\n"
+        f"• {U.PREMIUM_MONTH}\n"
+        f"• {U.PREMIUM_6MONTHS}"
+    )
+    if not PROVIDER_TOKEN:
+        txt += f"\n\n⚠️ {U.PREMIUM_NOT_CONFIGURED}"
+    await message.answer(txt, reply_markup=main_menu(uid))
+
+# -------------------------------
+# Завершение / завершить и искать нового
+# -------------------------------
+@dp.message(F.text.in_({UIru.END_CHAT, UIen.END_CHAT}))
+async def on_end_chat(message: Message):
+    uid = message.from_user.id
+    partner = await end_chat(uid)
+    U = ui_cls(uid)
+    await message.answer(U.DIALOG_ENDED, reply_markup=main_menu(uid))
+    if partner:
+        Up = ui_cls(partner)
+        await bot.send_message(partner, Up.DIALOG_ENDED, reply_markup=main_menu(partner))
+
+@dp.message(F.text.in_({UIru.END_AND_NEW, UIen.END_AND_NEW}))
+async def on_end_and_new(message: Message):
+    uid = message.from_user.id
+    partner = await end_chat(uid)
+    if partner:
+        Up = ui_cls(partner)
+        await bot.send_message(partner, Up.DIALOG_ENDED, reply_markup=main_menu(partner))
+    USERS.setdefault(uid, {})["wants_gender"] = "any"
+    await do_search_start(message, uid)
+
+# -------------------------------
+# Команды профиля / настройки
+# -------------------------------
+@dp.message(F.text.regexp(r"^/age\s+\d{1,3}$"))
+async def set_age(message: Message):
+    uid = message.from_user.id
+    age = int(message.text.split()[1])
+    if not (0 <= age <= 100):
+        await message.answer("Возраст должен быть от 0 до 100.")
+        return
+    USERS.setdefault(uid, {})["age"] = age
+    USERS[uid]["age_min"] = max(0, age - 2)
+    USERS[uid]["age_max"] = min(100, age + 2)
+    await message.answer(f"Возраст установлен: {age}", reply_markup=main_menu(uid))
+
+@dp.message(F.text.regexp(r"^/gender\s+(m|f)$"))
+async def set_gender(message: Message):
+    uid = message.from_user.id
+    g = message.text.split()[1].lower()
+    USERS.setdefault(uid, {})["gender"] = g
+    await message.answer(f"Пол установлен: {g}", reply_markup=main_menu(uid))
+
+@dp.message(F.text.regexp(r"^/wants\s+(any|m|f)$"))
+async def set_wants(message: Message):
+    uid = message.from_user.id
+    w = message.text.split()[1].lower()
+    USERS.setdefault(uid, {})["wants_gender"] = w
+    await message.answer(f"Кого искать: {w}", reply_markup=main_menu(uid))
+
+@dp.message(F.text.regexp(r"^/window\s+(\d{1,3})\s+(\d{1,3})$"))
+async def set_window(message: Message):
+    uid = message.from_user.id
+    _, a1, a2 = message.text.split()
+    a1, a2 = int(a1), int(a2)
+    if not (0 <= a1 <= 100 and 0 <= a2 <= 100 and a1 <= a2):
+        await message.answer("Окно возраста должно быть 0..100 и min<=max.")
+        return
+    USERS.setdefault(uid, {})["age_min"] = a1
+    USERS.setdefault(uid, {})["age_max"] = a2
+    await message.answer(f"Окно возраста: {a1}–{a2}", reply_markup=main_menu(uid))
+
+@dp.message(F.text.regexp(r"^/vibe\s+.+$"))
+async def set_vibe(message: Message):
+    # SAFE handler body: supports 'vibe:<key>' and 'vibe:reset' (or bare 'reset').
+    data = (callback.data or "").strip().lower()
+    prefix, sep, payload = data.partition(":")
+    key = (payload if sep else data)
+
+    # 1) RESET branch (never touches VIBES['reset'])
+    if key in {"reset", "clear", "none", ""}:
+        try:
+            from engine.database import update_user
+            await update_user(callback.from_user.id, vibe=None)
+        except Exception:
+            pass
+
+        kb = None
+        try:
+            from keyboards import build_vibes_keyboard
+            kb = build_vibes_keyboard(current=None)
+        except Exception:
+            pass
+
+        try:
+            try:
+                from utils_safe_edit import safe_edit_text
+                await safe_edit_text(callback.message, "✨ Вайб сброшен.", reply_markup=kb)
+            except Exception:
+                if kb:
+                    await callback.message.edit_text("✨ Вайб сброшен.", reply_markup=kb)
+                else:
+                    await callback.answer("✨ Вайб сброшен.", show_alert=False)
+        except Exception:
+            await callback.answer("✨ Вайб сброшен.", show_alert=False)
+        return
+
+    # 2) Specific vibe selection
+    try:
+        from texts_ui import VIBES
+    except Exception:
+        VIBES = {}
+
+    if key not in VIBES:
+        await callback.answer("Неизвестный выбор.", show_alert=False)
+        return
+
+    try:
+        from engine.database import update_user
+        await update_user(callback.from_user.id, vibe=key)
+    except Exception:
+        await callback.answer("Не удалось сохранить выбор.", show_alert=False)
+        return
+
+    kb = None
+    try:
+        from keyboards import build_vibes_keyboard
+        kb = build_vibes_keyboard(current=key)
+    except Exception:
+        pass
+
+    text = f"✨ Вайб обновлён: {VIBES.get(key, key)}"
+    try:
+        from utils_safe_edit import safe_edit_text
+        await safe_edit_text(callback.message, text, reply_markup=kb)
+    except Exception:
+        await callback.answer(text, show_alert=False)
+
+@dp.message(F.text.regexp(r"^/interests\s+.+$"))
+async def set_interests(message: Message):
+    uid = message.from_user.id
+    raw = message.text.split(maxsplit=1)[1]
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    USERS.setdefault(uid, {})["interests"] = items
+    await message.answer(f"Интересы: {', '.join(items)}", reply_markup=main_menu(uid))
+
+@dp.message(F.text.regexp(r"^/lang\s+(ru|en)$"))
+async def set_lang_cmd(message: Message):
+    uid = message.from_user.id
+    lang = message.text.split()[1].lower()
+    USERS.setdefault(uid, {})["lang"] = lang
+    await message.answer(("Язык: русский" if lang == "ru" else "Language: English"), reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_({"Русский", "English"}))
+async def set_lang_buttons(message: Message):
+    uid = message.from_user.id
+    lang = "ru" if message.text == "Русский" else "en"
+    USERS.setdefault(uid, {})["lang"] = lang
+    await message.answer(("Язык: русский" if lang == "ru" else "Language: English"), reply_markup=main_menu(uid))
+
+# -------------------------------
+# Поиск / мэтч (без «переключения» по повторному нажатию)
+# -------------------------------
+async def do_search_start(message: Message, uid: int):
+    U = ui_cls(uid)
+    if await in_queue(uid):
+        await message.answer(U.SEARCHING, reply_markup=main_menu(uid))
+        return
+
+    prof = await profile_cb(uid)
+    age = prof.get("age", 22)
+    if not isinstance(age, int) or not (0 <= age <= 100):
+        await message.answer("Возраст должен быть от 0 до 100. Установите его через /age.")
+        return
+
+    await add_to_queue(
+        user_id=uid,
+        lang=prof.get("lang", "ru"),
+        age=age,
+        gender=prof.get("gender"),
+        wants_gender=prof.get("wants_gender", "any"),
+        age_min=prof.get("age_min", max(0, age - 2)),
+        age_max=prof.get("age_max", min(100, age + 2)),
+        vibe=prof.get("vibe"),
+        interests=prof.get("interests", []),
+    )
+    await message.answer(U.SEARCHING, reply_markup=main_menu(uid))
+
+    partner = await try_match(uid, profile_cb)
+    if partner:
+        Up = ui_cls(partner)
+        await bot.send_message(uid, U.MATCH_FOUND, reply_markup=dialog_menu(uid))
+        await bot.send_message(partner, Up.MATCH_FOUND, reply_markup=dialog_menu(partner))
+        await bot.send_message(uid, U.NOW_IN_DIALOG)
+        await bot.send_message(partner, Up.NOW_IN_DIALOG)
+
+# -------------------------------
+# Privacy: /privacy и /forgetme
+# -------------------------------
+@dp.message(Command("privacy"))
+async def on_privacy(message: Message):
+    uid = message.from_user.id
+    U = ui_cls(uid)
+    p1 = getattr(U, "PRIVACY_SUMMARY", "Мы бережно относимся к данным (TTL-хранение медиа).")
+    p2 = getattr(U, "PRIVACY_MORE", "Используйте /forgetme для удаления аккаунта и медиа.")
+    await message.answer(f"{p1}\n{p2}", reply_markup=main_menu(uid))
+
+@dp.message(Command("forgetme"))
+async def on_forgetme(message: Message):
+    uid = message.from_user.id
+    try:
+        await forget_user(uid)       # удалить медиа + индекс
+        await db_purge_user(uid)     # очистить очереди/диалоги/недавние пары (fallback, если нет в БД)
+        USERS.pop(uid, None)
+        await message.answer("Ваши данные и медиа удалены. Чтобы продолжить — /start", reply_markup=main_menu(uid))
+    except Exception as e:
+        await message.answer(f"Ошибка при удалении: {e}")
+
+# -------------------------------
+# Релей сообщений + сохранение медиа (TTL)
+# -------------------------------
+async def _download_by_file_id(file_id: str, dest: Path):
+    f = await bot.get_file(file_id)
+    await bot.download(f, destination=dest)
+
+@dp.message(F.content_type.in_({
+    ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO,
+    ContentType.VOICE, ContentType.VIDEO_NOTE, ContentType.DOCUMENT
+}))
+async def relay(message: Message):
+    uid = message.from_user.id
+    partner = await get_partner_id(uid)
+    if not partner:
+        return
+
+    # Сохранение медиа в TTL-хранилище
+    fid = None; kind = None
+    if message.content_type == ContentType.TEXT:
+        pass
+    elif message.content_type == ContentType.PHOTO:
+        kind = "photos"; fid = message.photo[-1].file_id
+    elif message.content_type == ContentType.VIDEO:
+        kind = "videos"; fid = message.video.file_id
+    elif message.content_type == ContentType.VOICE:
+        kind = "voice"; fid = message.voice.file_id
+    elif message.content_type == ContentType.VIDEO_NOTE:
+        kind = "videonotes"; fid = message.video_note.file_id
+    elif message.content_type == ContentType.DOCUMENT:
+        kind = "docs"; fid = message.document.file_id
+
+    if fid and kind:
+        user_dir = ensure_user_dir(uid, kind)
+        ext = ".bin"
+        if kind == "photos": ext = ".jpg"
+        elif kind == "videos": ext = ".mp4"
+        elif kind == "voice": ext = ".ogg"
+        elif kind == "videonotes": ext = ".mp4"
+        name = f"{int(time.time())}_{fid}{ext}"
+        dest = user_dir / name
+        try:
+            await _download_by_file_id(fid, dest)
+            await index_media(uid, kind, dest)
+        except Exception:
+            pass
+
+    # Пересылка партнёру
+    if message.content_type == ContentType.TEXT:
+        await bot.send_message(partner, message.text)
+    elif message.content_type == ContentType.PHOTO:
+        await bot.send_photo(partner, message.photo[-1].file_id, caption=message.caption or None)
+    elif message.content_type == ContentType.VIDEO:
+        await bot.send_video(partner, message.video.file_id, caption=message.caption or None)
+    elif message.content_type == ContentType.VOICE:
+        await bot.send_voice(partner, message.voice.file_id, caption=message.caption or None)
+    elif message.content_type == ContentType.VIDEO_NOTE:
+        await bot.send_video_note(partner, message.video_note.file_id)
+    elif message.content_type == ContentType.DOCUMENT:
+        await bot.send_document(partner, message.document.file_id, caption=message.caption or None)
+
+# -------------------------------
+# main()
+# -------------------------------
+async def main():
+    await init_db()
+    # Фоновая очистка TTL-хранилища (универсальный вызов — на случай разных сигнатур)
+    try:
+        asyncio.create_task(run_cleanup_loop(dp, interval_minutes=10))
+    except TypeError:
+        try:
+            asyncio.create_task(run_cleanup_loop(bot, interval_minutes=10))
+        except TypeError:
+            asyncio.create_task(run_cleanup_loop(interval_minutes=10))
+
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+@router.callback_query((F.data == "vibe:reset") | (F.data == "reset") | F.data.endswith(":reset"))
+async def __fix_vibe_reset(callback: types.CallbackQuery):
+    """Безопасный сброс вайба: не падает на KeyError, обновляет профиль/UI по возможности."""
+    try:
+        # Обновить профиль (если доступна функция update_user)
+        try:
+            from engine.database import update_user
+            await update_user(callback.from_user.id, vibe=None)
+        except Exception:
+            pass
+        # Обновить клавиатуру, если есть сборщик диалоговой/настроечной клавы
+        try:
+            from keyboards import build_vibes_keyboard
+            kb = build_vibes_keyboard(current=None)
+            try:
+                from utils_safe_edit import safe_edit_text
+                await safe_edit_text(callback.message, "✨ Вайб сброшен.", reply_markup=kb)
+            except Exception:
+                await callback.message.edit_text("✨ Вайб сброшен.", reply_markup=kb)
+        except Exception:
+            # Если нет клавиатуры — просто ответим всплывашкой
+            try:
+                await callback.answer("✨ Вайб сброшен.", show_alert=False)
+            except Exception:
+                pass
+    except Exception:
+        # Никогда не валимся из-за сброса
+        try:
+            await callback.answer("✨ Вайб сброшен.", show_alert=False)
+        except Exception:
+            pass
