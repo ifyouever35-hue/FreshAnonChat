@@ -1,28 +1,10 @@
-# Виртуальное окружение
-.venv/
-venv/
-env/
-
-# Кэш Python
-__pycache__/
-*.pyc
-
-# Настройки IDE
-.idea/
-.vscode/
-
-# Базы данных
-*.db
-
-# Логи
-*.log
-
-# Секретные файлы
-.env
-
-# Файлы системы
-.DS_Store
-Thumbs.db
-
+# --- FreshAnonChat additions ---
 .env
 .env.*
+.venv/
+__pycache__/
+.idea/
+storage/
+media/
+*.log
+# --- end ---

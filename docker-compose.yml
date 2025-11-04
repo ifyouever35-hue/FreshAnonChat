@@ -6,7 +6,7 @@ services:
     container_name: freshanon-pg
     environment:
       POSTGRES_USER: freshanon
-      POSTGRES_PASSWORD: postgres!
+      POSTGRES_PASSWORD: postgres123
       POSTGRES_DB: freshanon
     ports:
       - "5433:5432"
