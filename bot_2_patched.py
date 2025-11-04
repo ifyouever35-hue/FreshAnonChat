@@ -23,6 +23,9 @@ from database import (
     set_premium_expiry, is_premium_active, get_premium_expiry,
     adjust_rating, add_report, add_rating_log,
     set_adult_pass, can_use_adult_trial, start_adult_trial, adult_access_active
+, record_interaction
+, has_interacted_recently
+, sanitize_age
 )
 
 # ===================== ЛОГИ и БОТ =====================
@@ -302,13 +305,13 @@ async def reg_gender_ok(message: types.Message, state: FSMContext):
 
 @dp.message(Reg.age, F.text.regexp(r"^\d+$"))
 async def reg_age_ok(message: types.Message, state: FSMContext):
-    age = int(message.text)
-    if not (13 <= age <= 100):
-        await message.answer("Возраст должен быть от 13 до 100. Попробуй ещё раз:")
-        return
-    await state.update_data(age=age)
-    await message.answer("Выбери язык:", reply_markup=language_keyboard())
-    await state.set_state(Reg.language)
+
+age = sanitize_age(message.text)
+if age is None:
+    await message.answer("Укажи возраст числом от 0 до 100.", reply_markup=main_keyboard())
+    return
+await update_user(message.from_user.id, {"age": age})
+await message.answer("Возраст обновлён.", reply_markup=main_keyboard())
 
 @dp.message(Reg.language)
 async def reg_lang(message: types.Message, state: FSMContext):
@@ -698,6 +701,7 @@ async def on_chat_started(uid: int, pid: int, is_adult: bool):
         media_allowed_until.pop(_pair_key(uid, pid), None)
 
     text = (
+        await record_interaction(uid, pid)
         "🌟 <b>Собеседник найден!</b>\n"
         + ("🔞 Режим: 18+ (медиа отключены по умолчанию)\n" if is_adult else "")
         + "\n🪄 Команды:\n/stop — завершить диалог\n/restart — завершить и искать нового"

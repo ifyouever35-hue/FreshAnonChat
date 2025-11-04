@@ -71,6 +71,18 @@ async def init_db(reset: bool = False):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     async with aiosqlite.connect(DB_PATH) as db:
+
+        # ensure anti-rematch table
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_pairs (
+                user_id    INTEGER NOT NULL,
+                partner_id INTEGER NOT NULL,
+                ts         INTEGER NOT NULL,
+                PRIMARY KEY (user_id, partner_id)
+            )
+            """
+        )
         await db.execute(USERS_SQL)
         await db.execute(REPORTS_SQL)
         await db.execute(RATINGS_LOG_SQL)
@@ -237,3 +249,40 @@ async def get_premium_expiry(user_id: int): return None
 async def is_premium_active(user_id: int): return False
 async def can_start_chat(a: int, b: int): return True
 async def on_chat_started(user_id: int): pass
+
+
+def sanitize_age(value) -> int | None:
+    """Return integer 0..100 or None if invalid."""
+    try:
+        age = int(str(value).strip())
+    except Exception:
+        return None
+    if 0 <= age <= 100:
+        return age
+    return None
+
+
+import time
+
+async def record_interaction(user_id: int, partner_id: int) -> None:
+    ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO recent_pairs(user_id, partner_id, ts) VALUES(?, ?, ?)",
+            (user_id, partner_id, ts)
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO recent_pairs(user_id, partner_id, ts) VALUES(?, ?, ?)",
+            (partner_id, user_id, ts)
+        )
+        await db.commit()
+
+async def has_interacted_recently(user_id: int, partner_id: int, minutes: int = 30) -> bool:
+    cutoff = int(time.time()) - minutes * 60
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM recent_pairs WHERE user_id=? AND partner_id=? AND ts>=? LIMIT 1",
+            (user_id, partner_id, cutoff)
+        )
+        row = await cur.fetchone()
+        return row is not None
